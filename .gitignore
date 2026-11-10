@@ -1,0 +1,25 @@
+# Build output
+build
+out
+*.dll
+*.pdb
+*.7z
+
+# IDE files
+.vs
+.vscode
+
+# Python caches
+__pycache__/
+
+# Local CMake presets
+CMakeUserPresets.json
+
+# Linked in locally, not part of this repository. extern/FasterArchives is the src folder of
+# https://github.com/1001Bits/Faster-Archives, extern/vcpkg a clone of https://github.com/microsoft/vcpkg.
+extern/vcpkg
+extern/DynamicTextureLODCore
+extern/FasterArchives
+
+# Left over from an earlier link, not used
+extern/vcpkg-seamless-unused

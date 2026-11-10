@@ -1,0 +1,56 @@
+{
+  "modName": "FasterTextures",
+  "displayName": "Faster Textures",
+  "cursorFillMode": "topToBottom",
+  "content": [
+    {
+      "text": "Load textures small first",
+      "type": "header"
+    },
+    {
+      "id": "bSmallOnLoadingScreens:Streamer",
+      "text": "During loading screens",
+      "type": "toggle",
+      "help": "On: shorter loading screens, and textures look soft for a moment afterwards. Off: textures are sharp when a loading screen ends, and loading screens take longer. Applies when you close this menu.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bSmallDuringPlay:Streamer",
+      "text": "During play",
+      "type": "toggle",
+      "help": "On: less stutter from large textures, and new objects can look soft for a moment. Off: they load at full size, as usual. Applies when you close this menu.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "text": "Cache",
+      "type": "header"
+    },
+    {
+      "id": "iCacheLocation:Streamer",
+      "text": "Cache location",
+      "type": "enum",
+      "help": "Where the cache is kept. A new location starts empty and fills in the background, and the old folder stays until you delete it. Applies after you restart the game.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "Beside the game",
+          "Local app data",
+          "Custom folder"
+        ]
+      }
+    },
+    {
+      "id": "sCacheFolder:Streamer",
+      "text": "Custom folder",
+      "type": "input",
+      "help": "The full path to use when Cache location is Custom folder, for example D:\\SkyrimCache. Applies after you restart the game.",
+      "valueOptions": {
+        "sourceType": "ModSettingString"
+      }
+    }
+  ]
+}

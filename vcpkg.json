@@ -1,0 +1,17 @@
+{
+  "name": "faster-textures-skyrim",
+  "version": "1.0.0",
+  "description": "SKSE plugin that loads textures small first for shorter loading screens, and manages texture LOD against the video memory budget (SE/AE/VR)",
+  "builtin-baseline": "36118ef68885436fd2a999188216337365856ad4",
+  "dependencies": [
+    "directxmath",
+    "directxtk",
+    "fmt",
+    "nlohmann-json",
+    "rapidcsv",
+    "simpleini",
+    "spdlog",
+    "toml11",
+    "xbyak"
+  ]
+}
