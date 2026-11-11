@@ -1,6 +1,7 @@
 #include "Streamer.h"
 
 #include "ArchiveTail.h"
+#include "DownscalerRules.h"
 #include "GpuCompletion.h"
 #include "HookPublication.h"
 #ifdef FASTER_TEXTURES_BENCH
@@ -13,6 +14,7 @@
 #include "FasterArchives/RuntimePolicy.h"
 
 #include <SimpleIni.h>
+#include <d3d11_3.h>
 #include <wrl/client.h>
 
 #include <condition_variable>
@@ -119,14 +121,14 @@ namespace {
     struct Totals {
         std::atomic<std::uint64_t> textures{0}, createTicks{0}, readTicks{0}, readBytes{0}, busyTicks{0};
         std::atomic<std::uint64_t> sourceCount[kSourceCount]{}, sourceBytes[kSourceCount]{}, sourceTicks[kSourceCount]{};
-        std::atomic<std::uint64_t> smallFromTail{0}, smallFromCache{0}, leftOutBytes{0}, handedToSps{0};
+        std::atomic<std::uint64_t> smallFromTail{0}, smallFromCache{0}, leftOutBytes{0}, handedToSps{0}, atDownscalerSize{0};
         std::atomic<std::uint64_t> excluded{0}, unnamed{0}, noPlan{0}, wholeFrame{0}, notFound{0}, failed{0}, foreign{0};
         std::atomic<std::uint64_t> possibleBytes{0}, possibleTailBytes{0}, possibleExcludedBytes{0}, possibleUnnamedBytes{0};
         std::atomic<std::uint64_t> renderThreadCount{0}, renderThreadTicks{0}, worstRenderThreadTicks{0};
         std::array<SizeFigures, kSizeCount> whole, small_;
 
         void Reset() {
-            for (auto* value : {&textures, &createTicks, &readTicks, &readBytes, &busyTicks, &smallFromTail, &smallFromCache, &leftOutBytes, &handedToSps, &excluded, &unnamed, &noPlan,
+            for (auto* value : {&textures, &createTicks, &readTicks, &readBytes, &busyTicks, &smallFromTail, &smallFromCache, &leftOutBytes, &handedToSps, &atDownscalerSize, &excluded, &unnamed, &noPlan,
                                 &wholeFrame, &notFound, &failed, &foreign, &possibleBytes, &possibleTailBytes, &possibleExcludedBytes, &possibleUnnamedBytes, &renderThreadCount, &renderThreadTicks, &worstRenderThreadTicks})
                 value->store(0, std::memory_order_relaxed);
             for (auto* figures : {&whole, &small_}) {
@@ -497,6 +499,7 @@ namespace {
         ID3D11ShaderResourceView* expectedView = nullptr;
         SkyrimSource::Info file;
         std::uint64_t fileBytes = 0;
+        std::uint32_t downscalerSkip = 0;  // the largest levels Texture Downscaler leaves out: the full version arrives without them
         bool queued = true, drawn = false, dead = false;
     };
 
@@ -676,7 +679,54 @@ namespace {
         if (g_records.erase(a_record->owner) != 0) g_pending.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    void Track(RE::NiSourceTexture* a_texture, Stream* a_stream, const SkyrimSource::Info& a_file, std::uint64_t a_fileBytes) {
+    // ── Texture Downscaler ───────────────────────────────────────────────────
+    //
+    // It cuts every texture the game creates down to a size it reads from its ini, and so would the full versions this plugin
+    // creates, but without a name to go on on that thread it would cut them all to its Diffuse limit, folders it keeps at full
+    // size included. So the size it gives each texture is worked out here from the same rules, the full version is created at
+    // that size past its hook, and a texture whose small version is already that small is final. Its own hook still cuts the
+    // small versions: it wraps this plugin's, installed later, and names the texture from the real stream.
+
+    bool g_downscalerInstalled = false;
+    std::atomic<std::shared_ptr<const DownscalerRules::Rules>> g_downscaler;  // null when it is not installed or switched off
+
+    // Its ini again: its menu writes there, and a change applies to textures loaded afterwards.
+    void ReadDownscalerRules() {
+        if (!g_downscalerInstalled) return;
+        auto rules = std::make_shared<DownscalerRules::Rules>();
+        CSimpleIniA ini;
+        ini.SetUnicode();
+        if (ini.LoadFile("Data/SKSE/Plugins/TextureDownscaler.ini") >= 0) {
+            if (!ini.GetBoolValue("General", "Enabled", true)) {
+                if (g_downscaler.exchange(nullptr)) SKSE::log::info("[stream] Texture Downscaler is switched off: full textures arrive at full size");
+                return;
+            }
+            for (std::size_t i = 0; i < DownscalerRules::kKinds; ++i)
+                rules->maxSize[i] = DownscalerRules::Clamp(ini.GetLongValue("Textures", DownscalerRules::kKindNames[i].data(), DownscalerRules::kDefaultLimit));
+            CSimpleIniA::TNamesDepend keys;
+            if (ini.GetAllKeys("Folders", keys)) {
+                keys.sort(CSimpleIniA::Entry::LoadOrder());
+                for (const auto& key : keys) DownscalerRules::AddFolder(*rules, key.pItem, ini.GetLongValue("Folders", key.pItem, 0));
+            }
+        }
+        const bool first = !g_downscaler.load(std::memory_order_acquire);
+        if (first)
+            SKSE::log::info("[stream] Texture Downscaler is installed: full textures arrive at its sizes (Diffuse {}, Normal {}, Parallax {}, Material {}, Glow {}, Mask {}, {} folder rules)",
+                            rules->maxSize[0], rules->maxSize[1], rules->maxSize[2], rules->maxSize[3], rules->maxSize[4], rules->maxSize[5], rules->folders.size());
+        g_downscaler.store(std::move(rules), std::memory_order_release);
+    }
+
+    // The name it goes by: the stream's own, or else the texture's. Many come through without either, and it then uses the
+    // Diffuse limit; so does this.
+    std::string DownscalerName(const RE::NiSourceTexture* a_texture, const Stream* a_real) {
+        RE::BSFixedString name;
+        a_real->DoGetName(name);
+        std::string_view text = name.c_str() ? name.c_str() : "";
+        if (text.empty() && a_texture->name.c_str()) text = a_texture->name.c_str();
+        return DownscalerRules::Fold(text);
+    }
+
+    void Track(RE::NiSourceTexture* a_texture, Stream* a_stream, const SkyrimSource::Info& a_file, std::uint64_t a_fileBytes, std::uint32_t a_downscalerSkip = 0) {
         auto record = std::make_shared<Record>();
         record->owner = a_texture;
         record->stream = a_stream;
@@ -685,6 +735,7 @@ namespace {
         record->expectedView = reinterpret_cast<ID3D11ShaderResourceView*>(a_texture->rendererTexture->resourceView);
         record->file = a_file;
         record->fileBytes = a_fileBytes;
+        record->downscalerSkip = a_downscalerSkip;
         {
             std::scoped_lock lock(g_lock);
             if (const auto old = g_records.find(a_texture); old != g_records.end()) {
@@ -931,9 +982,22 @@ namespace {
             Add(reduced->fromCache ? &Totals::smallFromCache : &Totals::smallFromTail, 1);
             Add(&Totals::leftOutBytes, plan.skippedBytes);
             try {
+                std::uint32_t downscalerSkip = 0;
+                if (const auto rules = g_downscaler.load(std::memory_order_acquire)) {
+                    const auto name = DownscalerName(a_texture, real);
+                    downscalerSkip = DownscalerRules::Skip(DownscalerRules::LimitFor(*rules, name), file.width, file.height, file.mips, DownscalerRules::BlockCompressed(file.format));
+                    // What the game made of the small version, after Texture Downscaler cut it too: when the full texture at its
+                    // size is no larger, there is nothing more to fetch.
+                    D3D11_TEXTURE2D_DESC made{};
+                    reinterpret_cast<ID3D11Texture2D*>(a_texture->rendererTexture->texture)->GetDesc(&made);
+                    if ((file.width >> downscalerSkip) <= made.Width && (file.height >> downscalerSkip) <= made.Height) {
+                        Add(&Totals::atDownscalerSize, 1);
+                        return;
+                    }
+                }
                 const auto sharing = g_sharing.load(std::memory_order_acquire);
                 if ((sharing == Sharing::kProbing || sharing == Sharing::kConfirmed) && SpsCanManage(a_texture)) HandToSps(a_texture, real, file, fileBytes);
-                else Track(a_texture, real, file, fileBytes);
+                else Track(a_texture, real, file, fileBytes, downscalerSkip);
             } catch (const std::exception&) {
                 Add(&Totals::failed, 1);  // stays small, nothing worse
             }
@@ -1089,6 +1153,34 @@ namespace {
         return ok;
     }
 
+    // Beside Texture Downscaler, the full version goes past its CreateTexture2D hook, which would cut it again to its Diffuse
+    // limit: CreateTexture2D1 is another entry of the same device that it leaves alone (checked in downscaler_bypass_tests).
+    // Where the device offers no ID3D11Device3, as some wrappers may not, its hook gets the texture already at its size and
+    // can only cut it further.
+    ComPtr<ID3D11Device3> g_device3;
+
+    HRESULT CreateFull(const D3D11_TEXTURE2D_DESC& a_desc, const D3D11_SUBRESOURCE_DATA* a_data, ID3D11Texture2D** a_out) {
+        if (g_downscalerInstalled && g_device3) {
+            D3D11_TEXTURE2D_DESC1 desc{};
+            desc.Width = a_desc.Width;
+            desc.Height = a_desc.Height;
+            desc.MipLevels = a_desc.MipLevels;
+            desc.ArraySize = a_desc.ArraySize;
+            desc.Format = a_desc.Format;
+            desc.SampleDesc = a_desc.SampleDesc;
+            desc.Usage = a_desc.Usage;
+            desc.BindFlags = a_desc.BindFlags;
+            desc.CPUAccessFlags = a_desc.CPUAccessFlags;
+            desc.MiscFlags = a_desc.MiscFlags;
+            desc.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+            ComPtr<ID3D11Texture2D1> texture;
+            const auto result = g_device3->CreateTexture2D1(&desc, a_data, texture.GetAddressOf());
+            if (SUCCEEDED(result)) *a_out = texture.Detach();
+            return result;
+        }
+        return Device()->CreateTexture2D(&a_desc, a_data, a_out);
+    }
+
     void Upgrade(const RecordPtr& a_record, std::vector<std::byte>& a_data) {
         const auto readStarted = Qpc();
         if (!ReadWhole(*a_record, a_data)) {
@@ -1125,9 +1217,10 @@ namespace {
             SKSE::log::warn("[stream] the game made format {} of a texture whose file has format {}; it stays small", static_cast<std::uint32_t>(textureDesc.Format), expected.format);
             return GiveUp(a_record);
         }
-        textureDesc.Width = expected.width;
-        textureDesc.Height = expected.height;
-        textureDesc.MipLevels = expected.mips;
+        const auto skip = std::min(a_record->downscalerSkip, expected.mips - 1);
+        textureDesc.Width = expected.width >> skip;
+        textureDesc.Height = expected.height >> skip;
+        textureDesc.MipLevels = expected.mips - skip;
         viewDesc.Texture2D.MostDetailedMip = 0;
         viewDesc.Texture2D.MipLevels = static_cast<UINT>(-1);
 
@@ -1140,13 +1233,14 @@ namespace {
         Ready ready;
         ready.record = a_record;
         const auto mips = MipTail::MipsOf(expected);
-        std::vector<D3D11_SUBRESOURCE_DATA> initial(mips.size());
-        for (std::size_t i = 0; i < mips.size(); ++i) {
-            initial[i].pSysMem = a_data.data() + mips[i].offset;
-            initial[i].SysMemPitch = mips[i].rowPitch;
-            initial[i].SysMemSlicePitch = mips[i].slicePitch;
+        std::vector<D3D11_SUBRESOURCE_DATA> initial(mips.size() - skip);
+        for (std::size_t i = 0; i < initial.size(); ++i) {
+            const auto& mip = mips[i + skip];
+            initial[i].pSysMem = a_data.data() + mip.offset;
+            initial[i].SysMemPitch = mip.rowPitch;
+            initial[i].SysMemSlicePitch = mip.slicePitch;
         }
-        if (FAILED(Device()->CreateTexture2D(&textureDesc, initial.data(), ready.texture.GetAddressOf())) ||
+        if (FAILED(CreateFull(textureDesc, initial.data(), ready.texture.GetAddressOf())) ||
             FAILED(Device()->CreateShaderResourceView(ready.texture.Get(), &viewDesc, ready.view.GetAddressOf())) ||
             !(ready.completion = SkyrimGpu::CreateCompletion(Device()))) {
             SKSE::log::warn("[stream] a texture's full version could not be created; it stays small");
@@ -1415,8 +1509,9 @@ namespace {
         const auto read = QpcSeconds(static_cast<std::int64_t>(u(a_totals.readTicks)));
         SKSE::log::info("[{}] {:.2f} s | {} textures: busy {:.2f} s ({:.0f} %), sum {:.2f} s = read and unpack {:.2f} s + create {:.2f} s, read {:.0f} MiB", a_title, a_seconds, count, busy,
                         a_seconds > 0 ? 100.0 * busy / a_seconds : 0.0, create, read, create - read, MiB(u(a_totals.readBytes)));
-        SKSE::log::info("[{}]   loaded small: {} from the end of the file, {} from the cache; left out {:.0f} MiB | kept whole: excluded {}, unnamed {}, nothing to gain {}, whole frame {}, not located {}, failed {}, other mods' files {}",
-                        a_title, u(a_totals.smallFromTail), u(a_totals.smallFromCache), MiB(u(a_totals.leftOutBytes)), u(a_totals.excluded), u(a_totals.unnamed), u(a_totals.noPlan),
+        const auto atSize = g_downscalerInstalled ? std::format(", {} of them already at Texture Downscaler's size", u(a_totals.atDownscalerSize)) : std::string();
+        SKSE::log::info("[{}]   loaded small: {} from the end of the file, {} from the cache{}; left out {:.0f} MiB | kept whole: excluded {}, unnamed {}, nothing to gain {}, whole frame {}, not located {}, failed {}, other mods' files {}",
+                        a_title, u(a_totals.smallFromTail), u(a_totals.smallFromCache), atSize, MiB(u(a_totals.leftOutBytes)), u(a_totals.excluded), u(a_totals.unnamed), u(a_totals.noPlan),
                         u(a_totals.wholeFrame), u(a_totals.notFound), u(a_totals.failed), u(a_totals.foreign));
         SKSE::log::info("[{}]   loose {} ({:.0f} MiB, {:.2f} s) | stored {} ({:.0f} MiB, {:.2f} s) | compressed {} ({:.0f} MiB, {:.2f} s) | could leave out {:.0f} MiB, {:.0f} MiB of it without unpacking; excluded paths hold {:.0f} MiB more, unnamed {:.0f} MiB",
                         a_title, u(a_totals.sourceCount[kLoose]), MiB(u(a_totals.sourceBytes[kLoose])), QpcSeconds(static_cast<std::int64_t>(u(a_totals.sourceTicks[kLoose]))), u(a_totals.sourceCount[kStored]),
@@ -1577,9 +1672,59 @@ namespace {
     }
 #endif
 
+    // ── The player's choices from the in-game menus ──────────────────────────
+    //
+    // SKSE Menu Framework's page saves to the file MCM Helper keeps, so both menus, and the reads below, agree on one place.
+    // The page changes them on the render thread, which does no file work: a save waits here and runs in the background,
+    // and the reads below write anything still waiting first, so a change can never be undone by an older file.
+
+    constexpr const char* kChoicesFile = "Data/MCM/Settings/FasterTextures.ini";
+    std::atomic<std::shared_ptr<const std::string>> g_cacheFolderInUse;  // for the menu's status line
+
+    std::mutex g_choicesLock;
+    struct PendingChoices {
+        std::optional<bool> onLoadingScreens, duringPlay;
+        std::optional<Streamer::CacheChoice> cache;
+    } g_pendingChoices;  // under g_choicesLock
+
+    void WriteChoicesLocked() {
+        auto& pending = g_pendingChoices;
+        if (!pending.onLoadingScreens && !pending.duringPlay && !pending.cache) return;
+        try {
+            std::filesystem::create_directories(std::filesystem::path(kChoicesFile).parent_path());
+        } catch (const std::exception&) {
+        }
+        CSimpleIniA ini;
+        ini.SetUnicode();
+        ini.LoadFile(kChoicesFile);  // keeps what is there: missing is fine
+        if (pending.onLoadingScreens) ini.SetLongValue("Streamer", "bSmallOnLoadingScreens", *pending.onLoadingScreens ? 1 : 0);
+        if (pending.duringPlay) ini.SetLongValue("Streamer", "bSmallDuringPlay", *pending.duringPlay ? 1 : 0);
+        if (pending.cache) {
+            ini.SetLongValue("Streamer", "iCacheLocation", pending.cache->location);
+            ini.SetValue("Streamer", "sCacheFolder", pending.cache->folder.c_str());
+        }
+        if (ini.SaveFile(kChoicesFile) < 0) {
+            SKSE::log::warn("[menu] {} could not be written; the choice lasts until the game closes", kChoicesFile);
+            return;  // kept pending: the next change or loading screen tries again
+        }
+        pending = {};
+    }
+
+    void SaveChoicesLater() {
+        std::thread([] {
+            try {
+                std::scoped_lock lock(g_choicesLock);
+                WriteChoicesLocked();
+            } catch (...) {
+            }
+        }).detach();
+    }
+
     // Read again at each loading screen and after the menu that holds the MCM closes, so a change needs no restart. MCM Helper writes only what the
     // player changed, to a file of its own, so that file wins where it has the key.
     void ReadSmallFirstChoices() {
+        std::scoped_lock choices(g_choicesLock);
+        WriteChoicesLocked();
         bool onLoadingScreens = true, duringPlay = true;
         for (const char* file : {"Data/SKSE/Plugins/FasterTextures.ini", "Data/MCM/Settings/FasterTextures.ini"}) {
             CSimpleIniA ini;
@@ -1603,6 +1748,7 @@ namespace {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                     try {
                         ReadSmallFirstChoices();
+                        ReadDownscalerRules();
                     } catch (...) {
                     }
                 }).detach();
@@ -1621,6 +1767,7 @@ namespace {
 #endif
                 BeginScreen();
                 ReadSmallFirstChoices();
+                ReadDownscalerRules();
                 g_loadStarted.store(now, std::memory_order_relaxed);
                 g_loading.store(true, std::memory_order_release);
 #ifdef FASTER_TEXTURES_BENCH
@@ -1802,6 +1949,7 @@ namespace {
             if (!cache->Open(folder, (std::numeric_limits<std::uint64_t>::max)(), g_archiveIds)) continue;  // no limit: only a full disk stops it
             const auto figures = cache->Current();
             SKSE::log::info("[stream] small mips cache in {}: {} textures, {:.0f} MiB", Utf8(folder), figures.entries, MiB(figures.bytes));
+            g_cacheFolderInUse.store(std::make_shared<const std::string>(Utf8(folder)), std::memory_order_release);
             g_cache.store(cache.release(), std::memory_order_release);  // never freed: in use until the game exits
             return;
         }
@@ -2030,11 +2178,16 @@ void Streamer::OnDataLoaded() {
     }
 #endif
     if (g_settings.mode != Mode::kStream) return;
-    if (GetModuleHandleW(L"TextureDownscaler.dll")) {
-        SKSE::log::warn("[stream] Texture Downscaler fixes these textures' sizes, so textures load whole; measuring only");
-        return;
+    g_downscalerInstalled = GetModuleHandleW(L"TextureDownscaler.dll") != nullptr;
+    if (g_downscalerInstalled) {
+        if (FAILED(Device()->QueryInterface(IID_PPV_ARGS(g_device3.GetAddressOf())))) {
+            g_device3.Reset();
+            SKSE::log::warn("[stream] the graphics device offers no ID3D11Device3: beside Texture Downscaler, some full textures may arrive smaller than it would make them");
+        }
+        ReadDownscalerRules();
     }
-    if (SpsStreams()) {
+    // SPS turns its own texture streaming off beside Texture Downscaler, so nothing is handed to it then.
+    if (!g_downscalerInstalled && SpsStreams()) {
         ReadSpsExclude();
         g_sharing.store(Sharing::kProbing, std::memory_order_release);  // the two minutes start at the first world load: no scene, no takeover
         SKSE::log::info("[stream] Skyrim Performance Solution's texture streaming is on: textures it can manage are handed to it after loading small");
@@ -2060,4 +2213,63 @@ void Streamer::OnDataLoaded() {
 void Streamer::LogSummary() {
     if (g_settings.mode == Mode::kOff) return;
     LogLine("session", 0.0, g_session);
+}
+
+bool Streamer::SmallFirst(bool a_loadingScreens) {
+    return (a_loadingScreens ? g_smallOnLoadingScreens : g_smallDuringPlay).load(std::memory_order_relaxed);
+}
+
+void Streamer::SetSmallFirst(bool a_loadingScreens, bool a_on) {
+    if ((a_loadingScreens ? g_smallOnLoadingScreens : g_smallDuringPlay).exchange(a_on, std::memory_order_relaxed) == a_on) return;
+    SKSE::log::info("[menu] {} now load {}", a_loadingScreens ? "loading screens" : "textures that load during play", a_on ? "small first" : "whole");
+    {
+        std::scoped_lock lock(g_choicesLock);
+        (a_loadingScreens ? g_pendingChoices.onLoadingScreens : g_pendingChoices.duringPlay) = a_on;
+    }
+    SaveChoicesLater();
+}
+
+Streamer::CacheChoice Streamer::SavedCacheChoice() {
+    std::scoped_lock lock(g_choicesLock);
+    if (g_pendingChoices.cache) return *g_pendingChoices.cache;
+    CSimpleIniA mcm;
+    mcm.SetUnicode();
+    mcm.LoadFile(kChoicesFile);
+    CacheChoice choice;
+    if (const auto location = mcm.GetLongValue("Streamer", "iCacheLocation", -1); location >= 0) {
+        choice.location = static_cast<int>(std::min<long>(location, 2));
+        choice.folder = mcm.GetValue("Streamer", "sCacheFolder", "");
+        return choice;
+    }
+    // No choice made in a menu: the SKSE ini's folder, if it names one.
+    CSimpleIniA ini;
+    ini.SetUnicode();
+    ini.LoadFile("Data/SKSE/Plugins/FasterTextures.ini");
+    choice.folder = ini.GetValue("Streamer", "CacheFolder", "");
+    choice.location = choice.folder.empty() ? 0 : 2;
+    return choice;
+}
+
+void Streamer::SetCacheChoice(const CacheChoice& a_choice) {
+    SKSE::log::info("[menu] cache location set to {}{}; applies after a restart", a_choice.location == 1 ? "local app data" : a_choice.location == 2 ? "a folder: " : "beside the game",
+                    a_choice.location == 2 ? a_choice.folder : std::string());
+    {
+        std::scoped_lock lock(g_choicesLock);
+        g_pendingChoices.cache = a_choice;
+    }
+    SaveChoicesLater();
+}
+
+std::string Streamer::Status() {
+    std::string status;
+    if (g_settings.mode == Mode::kOff) status = "Off: Mode=0 in Data\\SKSE\\Plugins\\FasterTextures.ini.";
+    else if (g_settings.mode == Mode::kMeasure) status = "Measuring only: Mode=1 in Data\\SKSE\\Plugins\\FasterTextures.ini, textures load whole.";
+    else if (!g_streaming.load(std::memory_order_acquire)) status = "Small first did not start this session; FasterTextures.log says why.";
+    else if (g_presentLost.load(std::memory_order_acquire)) status = "Small first stopped: the game no longer presents through the hooked swap chain; see FasterTextures.log.";
+    else status = "Loading textures small first.";
+    if (g_downscaler.load(std::memory_order_acquire)) status += "\nTexture Downscaler: full textures arrive at the sizes it gives them.";
+    const auto sharing = g_sharing.load(std::memory_order_acquire);
+    if (sharing == Sharing::kProbing || sharing == Sharing::kConfirmed) status += "\nSkyrim Performance Solution streams textures: those it can manage are handed to it.";
+    if (const auto folder = g_cacheFolderInUse.load(std::memory_order_acquire)) status += "\nSmall mips cache: " + *folder;
+    return status;
 }

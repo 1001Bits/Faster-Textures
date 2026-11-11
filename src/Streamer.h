@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 // Loads textures small first and fetches the rest in the background.
 //
@@ -28,9 +29,25 @@ namespace Streamer {
     void Install();
 
     // Starts the background work, once the renderer exists and every plugin has
-    // loaded. Stands down beside Texture Downscaler. Beside Skyrim Performance
-    // Solution's texture streaming, what SPS can manage is handed to it after loading.
+    // loaded. Beside Texture Downscaler, full textures arrive at the sizes it gives
+    // them. Beside Skyrim Performance Solution's texture streaming, what SPS can
+    // manage is handed to it after loading.
     void OnDataLoaded();
 
     void LogSummary();
+
+    // The in-game menus. SkyUI's MCM (through MCM Helper) and SKSE Menu Framework's
+    // page both keep the player's choices in Data/MCM/Settings/FasterTextures.ini,
+    // which wins over the SKSE ini.
+    bool SmallFirst(bool a_loadingScreens);                // what applies now
+    void SetSmallFirst(bool a_loadingScreens, bool a_on);  // applies at once, saved in the background
+
+    struct CacheChoice {
+        int location = 0;  // 0 beside the game, 1 local app data, 2 the folder below
+        std::string folder;
+    };
+    CacheChoice SavedCacheChoice();              // reads the files: not on the render thread
+    void SetCacheChoice(const CacheChoice& a_choice);  // saved in the background, applies after a restart
+
+    std::string Status();  // what runs this session, in a line or two
 }

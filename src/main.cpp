@@ -1,11 +1,15 @@
 // Faster Textures for Skyrim (SE / AE / VR)
 
 #include "Logging.h"
+#include "SmfMenu.h"
 #include "Streamer.h"
 
 namespace {
     void OnMessage(SKSE::MessagingInterface::Message* message) {
         switch (message->type) {
+            case SKSE::MessagingInterface::kPostLoad:
+                SmfMenu::Register();
+                break;
             case SKSE::MessagingInterface::kDataLoaded:
                 Streamer::OnDataLoaded();
                 break;
